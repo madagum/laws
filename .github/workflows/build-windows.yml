@@ -1,0 +1,101 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Hugo Extended
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: 'latest'
+          extended: true
+
+      - name: Install dependencies
+        run: |
+          npm install
+
+      - name: Build Hugo Site
+        run: |
+          hugo --minify --baseURL "/"
+
+      - name: Setup Electron Wrapper
+        shell: bash
+        run: |
+          # 安装打包依赖
+          npm install --save-dev electron electron-builder serve-handler
+          
+          # 注入 Electron 主进程入口文件
+          cat << 'EOF' > main.js
+          const { app, BrowserWindow } = require('electron');
+          const path = require('path');
+          const http = require('http');
+          const serveHandler = require('serve-handler');
+
+          let mainWindow;
+          let server;
+
+          function startServer() {
+            return new Promise((resolve) => {
+              server = http.createServer((request, response) => {
+                return serveHandler(request, response, {
+                  public: path.join(__dirname, 'public'),
+                  cleanUrls: true
+                });
+              });
+              server.listen(0, '127.0.0.1', () => {
+                resolve(server.address().port);
+              });
+            });
+          }
+
+          async function createWindow() {
+            const port = await startServer();
+            mainWindow = new BrowserWindow({
+              width: 1280,
+              height: 860,
+              title: "中国法律法规文库",
+              autoHideMenuBar: true,
+              webPreferences: {
+                nodeIntegration: false,
+                contextIsolation: true
+              }
+            });
+
+            mainWindow.loadURL(`http://127.0.0.1:${port}`);
+          }
+
+          app.whenReady().then(createWindow);
+
+          app.on('window-all-closed', () => {
+            if (server) server.close();
+            if (process.platform !== 'darwin') app.quit();
+          });
+          EOF
+
+      - name: Build Windows Installer
+        run: |
+          npx electron-builder --windows --x64 --config.extraMetadata.main="main.js" --config.extraMetadata.name="laws-desktop" --config.extraMetadata.productName="中国法律法规文库" --config.files="main.js,public/**,node_modules/**" --config.nsis.oneClick=false --config.nsis.allowToChangeInstallationDirectory=true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: laws-windows-setup
+          path: dist/*.exe
