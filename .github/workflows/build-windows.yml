@@ -1,0 +1,155 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      HUGO_SECURITY_NODE_PERMISSIONS_DISABLE: "true"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Remove pnpm lockfile
+        shell: pwsh
+        run: |
+          # 移除仓库自带的 pnpm-lock.yaml，防止 electron-builder 误调用未安装的 pnpm
+          Remove-Item -Path "pnpm-lock.yaml" -Force -ErrorAction SilentlyContinue
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Hugo Extended
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: 'latest'
+          extended: true
+
+      - name: Install dependencies
+        run: |
+          npm install
+
+      - name: Build Hugo Site
+        run: |
+          hugo --minify --baseURL "/"
+
+      - name: Setup Electron Wrapper
+        shell: pwsh
+        run: |
+          # 仅安装打包工具
+          npm install --save-dev electron electron-builder
+
+          # 写入零外部依赖的纯 Node 本地服务器及桌面窗口代码
+          $mainContent = @'
+          const { app, BrowserWindow } = require('electron');
+          const path = require('path');
+          const http = require('http');
+          const fs = require('fs');
+
+          let mainWindow;
+          let serverInstance;
+
+          const MIME_TYPES = {
+            '.html': 'text/html; charset=utf-8',
+            '.css': 'text/css; charset=utf-8',
+            '.js': 'application/javascript; charset=utf-8',
+            '.json': 'application/json; charset=utf-8',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.ico': 'image/x-icon',
+            '.woff': 'font/woff',
+            '.woff2': 'font/woff2',
+            '.ttf': 'font/ttf',
+            '.xml': 'application/xml',
+            '.txt': 'text/plain; charset=utf-8'
+          };
+
+          function startServer(publicDir) {
+            return new Promise((resolve) => {
+              const server = http.createServer((req, res) => {
+                try {
+                  let reqPath = decodeURI(req.url.split('?')[0]);
+                  let filePath = path.join(publicDir, reqPath);
+
+                  if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+                    filePath = path.join(filePath, 'index.html');
+                  }
+
+                  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+                    const notFoundPath = path.join(publicDir, '404.html');
+                    if (fs.existsSync(notFoundPath)) {
+                      res.statusCode = 404;
+                      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+                      return fs.createReadStream(notFoundPath).pipe(res);
+                    }
+                    res.statusCode = 404;
+                    return res.end('Not Found');
+                  }
+
+                  const ext = path.extname(filePath).toLowerCase();
+                  res.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
+                  fs.createReadStream(filePath).pipe(res);
+                } catch (err) {
+                  res.statusCode = 500;
+                  res.end('Server Error');
+                }
+              });
+
+              server.listen(0, '127.0.0.1', () => {
+                resolve({ server, port: server.address().port });
+              });
+            });
+          }
+
+          async function createWindow() {
+            const publicDir = path.join(__dirname, 'public');
+            const { server, port } = await startServer(publicDir);
+            serverInstance = server;
+
+            mainWindow = new BrowserWindow({
+              width: 1280,
+              height: 860,
+              title: "中国法律法规文库",
+              autoHideMenuBar: true,
+              webPreferences: {
+                nodeIntegration: false,
+                contextIsolation: true
+              }
+            });
+
+            mainWindow.loadURL(`http://127.0.0.1:${port}`);
+          }
+
+          app.whenReady().then(createWindow);
+
+          app.on('window-all-closed', () => {
+            if (serverInstance) serverInstance.close();
+            if (process.platform !== 'darwin') app.quit();
+          });
+          '@
+          Set-Content -Path "main.js" -Value $mainContent -Encoding UTF8
+
+      - name: Build Windows Installer
+        run: |
+          npx electron-builder --windows --x64 --publish never --config.extraMetadata.main="main.js" --config.extraMetadata.name="laws-desktop" --config.extraMetadata.productName="中国法律法规文库" --config.extraMetadata.description="中国法律法规文库桌面离线版" --config.files="main.js,public/**" --config.nsis.oneClick=false --config.nsis.allowToChangeInstallationDirectory=true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: laws-windows-setup
+          path: dist/*.exe
